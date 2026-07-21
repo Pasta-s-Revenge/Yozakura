@@ -4,29 +4,45 @@
 
 **Run models larger than your machine should normally be able to hold.**
 
-Yozakura is an experimental hypernetwork runtime for making very large language models practical on consumer hardware. Its goal is to let anyone run capable, large-scale models at home by replacing the assumption that every parameter must be stored and loaded as a conventional dense checkpoint.
+Yozakura is an experimental hypernetwork runtime for making very large language models practical on consumer hardware. Its long-term goal is to let anyone run capable, large-scale models at home by replacing the assumption that every parameter must be stored and loaded as a conventional dense checkpoint.
 
-The core idea is to represent reusable model structure compactly, reconstruct model-specific weights from a `.sun` hypernetwork archive, and place those weights across GPU, CPU RAM, and disk without requiring the complete model to reside in one memory tier.
+The core idea is to represent reusable model structure compactly, then reconstruct or generate the required weights with a hypernetwork only when they are needed. Yozakura targets CPU, GPU, and heterogeneous memory systems, with an emphasis on low-capacity machines rather than datacenter-only deployments.
+
+> The current runtime supports bounded SUN reconstruction, GPU/CPU/disk tiering, and an end-to-end out-of-core construction path for compatible SafeTensors checkpoints. It does not yet provide fused on-the-fly weight generation.
 
 ## Mission
 
-Yozakura targets three barriers to local LLM inference:
+Yozakura aims to reduce three barriers to local LLM inference:
 
 1. **Storage** — avoid distributing another complete copy of mostly shared model weights.
 2. **Memory** — reconstruct, stream, cache, and evict model components instead of requiring the full checkpoint to remain resident.
 3. **Latency** — develop fused reconstruction and inference paths so compact representations do not create unacceptable runtime overhead.
 
-## Technical model
+The intended end state is a local runtime where a consumer machine can execute a model whose conventional checkpoint is substantially larger than its available RAM or VRAM.
+
+## Technical direction
+
+Yozakura treats a model as:
 
 ```text
-model = shared base checkpoint + generated/reconstructed specialization
+model = shared base structure + generated/reconstructed specialization
 ```
 
-A `.sun` archive stores the information needed to recover model-specific weights relative to a compatible base model. Yozakura evaluates the complete system using peak RAM/VRAM, persistent storage, throughput, first-token latency, reconstruction quality, and energy consumption.
+A compact hypernetwork representation stores the information needed to recover model-specific weights relative to a compatible base model. The runtime can reconstruct a SafeTensors checkpoint one tensor at a time, instantiate the model on the meta device, and load weights directly into GPU, CPU, or disk tiers.
+
+The project is guided by measurable constraints rather than nominal parameter counts:
+
+- peak RAM and VRAM usage;
+- persistent storage size;
+- tokens per second and time to first token;
+- reconstruction error and downstream quality;
+- energy consumption on consumer hardware.
+
+A representation is useful only when it improves the complete system trade-off. Exact reconstruction that consumes more space than the original is not compression, and a smaller artifact that makes inference impractically slow is not a successful runtime.
 
 ## Current implementation: `.sun`
 
-A `.sun` (**Shared Universal Network**) archive contains:
+Yozakura currently provides a portable hypernetwork-delta archive named `.sun` (**Shared Universal Network**). A `.sun` file contains:
 
 - a reference to a compatible base model rather than another copy of its weights;
 - shared low-rank factor prototypes grouped by module type;
@@ -34,7 +50,13 @@ A `.sun` (**Shared Universal Network**) archive contains:
 - a deterministic manifest with checksums and evaluation metadata;
 - non-executable tensor data stored with SafeTensors.
 
-The target and base models must currently share the same architecture and matching projection tensor shapes.
+The target and base models must currently share the same architecture and matching linear tensor shapes.
+
+## Why the previous checkpoint approach failed
+
+The previous LayerForge v2 experiment stored one 16-bit dense base per tested layer, then added rank-128 prototype factors and a controller. Its reported `compression_ratio=1.169526` represented a **16.95% expansion**, not compression. Exact reconstruction (`NMSE=0` with unchanged perplexity) did not compensate for the larger representation.
+
+Yozakura therefore evaluates compression at the artifact and runtime-system level, with hard release gates for reconstruction error and effective distribution size.
 
 ## Install
 
@@ -42,7 +64,22 @@ The target and base models must currently share the same architecture and matchi
 pip install -e .
 ```
 
+## Colab demo
+
+Open [`notebooks/Yozakura_Colab_Demo.ipynb`](notebooks/Yozakura_Colab_Demo.ipynb) in Google Colab to run a tiny end-to-end smoke test and an out-of-core `.sun` template. For this private repository, add a Colab Secret named `GITHUB_TOKEN` with read access to the repository.
+
+The notebook demonstrates:
+
+- creation of a tiny `.sun` smoke artifact;
+- one-tensor-at-a-time base checkpoint reconstruction;
+- meta-device initialization;
+- GPU/CPU/disk placement;
+- generation and reconstructed-checkpoint cache reuse;
+- upload and execution of a user-provided `.sun` file.
+
 ## Build a `.sun` archive
+
+Building a 9B delta can still be memory-intensive even when the resulting artifact is CPU-runnable. Use CPU for compatibility or CUDA for faster construction.
 
 ```bash
 yozakura build \
@@ -57,28 +94,25 @@ yozakura build \
 
 The build is rejected and the artifact deleted when the configured reconstruction-error or effective-distribution-size gate is exceeded.
 
-## Run
+## Runtime modes
 
-CPU:
+### Eager CPU or GPU
 
-```bash
-yozakura run qwythos-9b.sun \
-  --device cpu \
-  --prompt "Write a Python function that validates a DAG."
-```
-
-GPU:
+The complete base model is loaded, then SUN deltas are applied with bounded reconstruction workspace.
 
 ```bash
-yozakura run qwythos-9b.sun \
+yozakura run model.sun \
   --device cuda \
+  --workspace-mib 256 \
   --prompt "Explain speculative decoding."
 ```
 
-Tiered GPU/CPU/disk execution after eager host reconstruction:
+### Tiered GPU, CPU, and disk
+
+The complete model is reconstructed in CPU RAM first, then Accelerate places modules across memory tiers.
 
 ```bash
-yozakura run qwythos-9b.sun \
+yozakura run model.sun \
   --device auto \
   --max-memory 0=8GiB \
   --max-memory cpu=24GiB \
@@ -86,30 +120,39 @@ yozakura run qwythos-9b.sun \
   --prompt "Explain bounded-memory inference."
 ```
 
-Fully out-of-core construction and execution:
+### Fully out-of-core construction and execution
+
+This mode does not materialize the complete base checkpoint in host RAM during construction.
 
 ```bash
-yozakura run qwythos-9b.sun \
+yozakura run model.sun \
   --device out-of-core \
+  --dtype float16 \
   --max-memory 0=8GiB \
   --max-memory cpu=16GiB \
   --offload-folder .yozakura-offload \
   --checkpoint-cache .yozakura-checkpoints \
   --workspace-mib 256 \
-  --prompt "Explain out-of-core model execution."
+  --prompt "Explain out-of-core inference."
 ```
 
-The out-of-core path performs the following pipeline:
+The first run performs this pipeline:
 
-1. resolve the base SafeTensors checkpoint and its shard index;
-2. read one base tensor at a time;
-3. apply the matching SUN low-rank delta using bounded row chunks;
-4. write a deterministic reconstructed SafeTensors cache;
-5. instantiate the model structure on the `meta` device;
-6. load weights directly into an inferred GPU/CPU/disk device map;
-7. run generation through Accelerate offload hooks.
+```text
+base SafeTensors shard
+        ↓ one tensor
+bounded SUN reconstruction
+        ↓
+reconstructed SafeTensors cache
+        ↓
+meta-initialized Transformers model
+        ↓
+GPU / CPU / disk device map
+        ↓
+generation through Accelerate hooks
+```
 
-During reconstruction, peak model-weight memory is bounded by the current base tensor, the low-rank factors, and the configured SUN workspace rather than the complete checkpoint size. The reconstructed checkpoint cache is reused on later runs.
+Subsequent runs reuse the reconstructed checkpoint when the SUN checksum, base model identity, dtype, and format version match.
 
 ## `.sun` v1 layout
 
@@ -121,58 +164,68 @@ model.sun
 
 `manifest.json` records the format version, base and target model IDs, module mapping, rank, prototype count, evaluation metadata, and SHA-256 checksum of the tensor payload. `tensors.safetensors` contains only non-executable tensor data.
 
-## Runtime modes
+## Memory guarantees
 
-| Mode | Initial host RAM requirement | Runtime placement |
-|---|---:|---|
-| `cpu` | complete reconstructed model | CPU |
-| `cuda` | complete reconstructed model | one GPU |
-| `auto` | complete reconstructed model during initialization | GPU + CPU + disk |
-| `out-of-core` | current tensor + bounded SUN workspace | GPU + CPU + disk |
+During out-of-core cache construction, model-weight residency is approximately bounded by:
+
+```text
+current base tensor
++ current low-rank right factor
++ bounded left-factor row chunks
++ SafeTensors serialization overhead
+```
+
+The complete model structure is created on `meta`; reconstructed weights are then loaded directly into the inferred memory tiers.
+
+## Current trade-offs and limitations
+
+- the first out-of-core run requires persistent storage approximately equal to the reconstructed model size;
+- the initial bounded writer stores one tensor per SafeTensors file, which increases filesystem overhead;
+- only SafeTensors base checkpoints are accepted by the out-of-core reader;
+- base and target models must have compatible architecture and matching selected tensor shapes;
+- reconstruction is performed before inference rather than fused into matrix multiplication;
+- GGUF base loading is not implemented;
+- multimodal processor support is incomplete;
+- unrelated model architectures cannot yet share one universal base.
 
 ## Roadmap
 
-### Implemented
+### Phase 1 — Compact specialization archives
 
 - deterministic `.sun` artifacts;
 - quantized low-rank reconstruction;
+- strict quality and size gates;
+- CPU and CUDA execution through PyTorch and Transformers.
+
+### Phase 2 — Memory-bounded execution
+
 - bounded reconstruction workspace;
-- isolated memory, speed, and quality benchmarks;
-- GPU/CPU/disk tiered placement;
-- SafeTensors shard resolution;
-- full out-of-core checkpoint reconstruction;
-- `meta` initialization and direct tiered loading.
+- GPU, CPU, and disk tiering;
+- SafeTensors tensor-level checkpoint reading;
+- meta-device out-of-core model construction;
+- persistent reconstructed-checkpoint caching;
+- peak-memory benchmarks on commodity machines.
 
-### Next performance work
+### Phase 3 — High-speed hypernetwork runtime
 
-- asynchronous base-shard and SUN-factor prefetch;
-- larger reconstructed shard packing to reduce filesystem overhead;
-- direct reconstruction into Accelerate offload storage without an intermediate cache;
+- direct reconstruction into offload storage;
+- asynchronous shard and layer prefetch;
 - fused reconstruction and matrix-multiplication kernels;
-- quantized base-model backends;
-- paged or quantized KV caches.
+- on-the-fly generated weights without a full reconstructed checkpoint;
+- hardware-aware scheduling across CPU, integrated GPU, and discrete GPU;
+- quantized base-model backends, including GGUF-compatible paths where practical.
 
-### Broader compatibility
+### Phase 4 — Broad model support
 
 - architecture adapters beyond shape-identical descendants;
 - multimodal processor plumbing;
-- GGUF-compatible loading where practical;
-- reusable universal bases and composable specialization modules.
-
-## Current limitations
-
-- the base checkpoint must be available in SafeTensors format;
-- the out-of-core path creates a reconstructed checkpoint cache, requiring temporary persistent storage approximately equal to the reconstructed model size;
-- first execution includes reconstruction I/O and is slower than subsequent cached runs;
-- tensor-per-file cache layout prioritizes bounded memory over filesystem efficiency;
-- fused on-the-fly hypernetwork kernels are not yet implemented;
-- target and base architectures must currently be shape-compatible;
-- multimodal and GGUF paths are not yet supported.
+- reusable universal bases and composable specialization modules;
+- reproducible quality, speed, memory, storage, and energy benchmarks.
 
 ## Security and licensing
 
-`.sun` never uses pickle and does not embed Python code. The out-of-core reader rejects pickle-based `.bin` checkpoint shards. Consumers still need access to the declared base model and must comply with the licenses of both the base and target models.
+`.sun` never uses pickle and does not embed Python code. Consumers still need access to the declared base model and must comply with the licenses of both the base and target models.
 
 ## Success criteria
 
-Yozakura considers the memory objective met when a consumer machine can construct and execute a compatible model whose conventional checkpoint exceeds available RAM or VRAM, while remaining within declared memory budgets. Quality, latency, storage amplification, and energy use remain independent release criteria.
+Yozakura will consider the direction successful when it can demonstrate, reproducibly, that a consumer machine can run a model substantially larger than its normal resident-memory limit while preserving useful model quality and achieving practical interactive latency.
