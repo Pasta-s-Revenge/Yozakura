@@ -21,6 +21,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 yozakura = "yozakura.cli:main"
+yozakura-benchmark = "yozakura.benchmark:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/yozakura"]
