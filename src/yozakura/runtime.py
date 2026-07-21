@@ -192,18 +192,40 @@ def load_sun_model(
     workspace_mib: int = DEFAULT_WORKSPACE_MIB,
     max_memory: Mapping[int | str, int | str] | None = None,
     offload_folder: str | None = None,
+    checkpoint_cache: str = ".yozakura-checkpoints",
+    revision: str | None = None,
+    local_files_only: bool = False,
     **model_kwargs: Any,
 ):
-    """Load, reconstruct, and optionally tier a SUN model.
+    """Load a SUN model using eager, tiered, or fully out-of-core construction.
 
-    ``device='auto'`` reconstructs the model on CPU first, then lets Accelerate
-    place complete modules across GPU, CPU RAM, and disk according to
-    ``max_memory``. This bounds accelerator residency, but the reconstructed
-    base model must still fit in host RAM during the initial load in this phase.
+    ``device='out-of-core'`` never materializes the complete base model in host
+    RAM. It reconstructs a cached SafeTensors checkpoint one tensor at a time,
+    creates the model on the meta device, then loads it directly into the
+    inferred GPU/CPU/disk device map.
     """
-    manifest = SunArchive.read_manifest(sun_path)
     if dtype is None:
         dtype = torch.float16
+    if device == "out-of-core":
+        if model_kwargs:
+            unsupported = ", ".join(sorted(model_kwargs))
+            raise ValueError(f"Out-of-core loading does not accept model kwargs yet: {unsupported}")
+        from .out_of_core import load_out_of_core_sun_model
+
+        return load_out_of_core_sun_model(
+            sun_path,
+            dtype=dtype,
+            max_memory=max_memory,
+            offload_folder=offload_folder,
+            checkpoint_cache=checkpoint_cache,
+            workspace_mib=workspace_mib,
+            verify_archive=verify_archive,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+
+    manifest = SunArchive.read_manifest(sun_path)
     task = str(manifest.metadata.get("task", "causal-lm"))
     adapter, _ = resolve_adapter(manifest.base_model, task, trust_remote_code=trust_remote_code)
     model = adapter.model_class.from_pretrained(
@@ -211,6 +233,8 @@ def load_sun_model(
         dtype=dtype,
         low_cpu_mem_usage=True,
         trust_remote_code=trust_remote_code,
+        revision=revision,
+        local_files_only=local_files_only,
         **model_kwargs,
     ).eval()
 
