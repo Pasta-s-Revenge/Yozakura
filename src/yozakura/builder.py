@@ -5,9 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch.nn as nn
-from transformers import AutoModelForCausalLM
 
+from .adapters import matching_linears, resolve_adapter
 from .archive import SunArchive, SunManifest
 from .codec import quantize_symmetric
 
@@ -17,7 +16,8 @@ class BuildConfig:
     base_model: str
     target_model: str
     output: str
-    modules: tuple[str, ...] = ("gate_proj", "up_proj", "down_proj")
+    modules: tuple[str, ...] | None = None
+    task: str = "auto"
     rank: int = 32
     prototypes_per_module: int = 4
     max_layers: int | None = None
@@ -25,10 +25,6 @@ class BuildConfig:
     trust_remote_code: bool = False
     max_relative_nmse: float = 0.15
     max_distribution_ratio: float = 0.75
-
-
-def _named_linears(model: nn.Module, suffixes: tuple[str, ...]) -> dict[str, nn.Linear]:
-    return {name: module for name, module in model.named_modules() if isinstance(module, nn.Linear) and name.rsplit(".", 1)[-1] in suffixes}
 
 
 def _factorize(delta: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -55,15 +51,18 @@ def _kmeans_rows(x: torch.Tensor, k: int, steps: int = 25) -> torch.Tensor:
 def build_sun(config: BuildConfig) -> Path:
     dtype = torch.float32 if config.device == "cpu" else torch.float16
     common = dict(torch_dtype=dtype, low_cpu_mem_usage=True, trust_remote_code=config.trust_remote_code)
-    base = AutoModelForCausalLM.from_pretrained(config.base_model, **common).to(config.device).eval()
-    target = AutoModelForCausalLM.from_pretrained(config.target_model, **common).to(config.device).eval()
-    base_linears = _named_linears(base, config.modules)
-    target_linears = _named_linears(target, config.modules)
-    names = sorted(set(base_linears) & set(target_linears))
+    base_adapter, base_cfg = resolve_adapter(config.base_model, config.task, trust_remote_code=config.trust_remote_code)
+    target_adapter, target_cfg = resolve_adapter(config.target_model, config.task, trust_remote_code=config.trust_remote_code)
+    if base_adapter.task != target_adapter.task:
+        raise ValueError(f"Task mismatch: {base_adapter.task} != {target_adapter.task}")
+    base = base_adapter.model_class.from_pretrained(config.base_model, **common).to(config.device).eval()
+    target = target_adapter.model_class.from_pretrained(config.target_model, **common).to(config.device).eval()
+    base_linears, target_linears, selected_modules = matching_linears(base, target, config.modules)
+    names = sorted(base_linears)
     if config.max_layers is not None:
-        names = names[: config.max_layers * len(config.modules)]
+        names = names[: config.max_layers * max(len(selected_modules), 1)]
     if not names:
-        raise RuntimeError("No matching target linear modules found")
+        raise RuntimeError("No repeated matching linear modules found; pass --modules explicitly")
 
     grouped = defaultdict(list)
     raw_target_bytes = 0
@@ -71,17 +70,14 @@ def build_sun(config: BuildConfig) -> Path:
     with torch.no_grad():
         for name in names:
             bw, tw = base_linears[name].weight, target_linears[name].weight
-            if bw.shape != tw.shape:
-                raise ValueError(f"Shape mismatch for {name}: {bw.shape} != {tw.shape}")
             delta = (tw - bw).cpu().float()
             left, right = _factorize(delta, config.rank)
             grouped[name.rsplit(".", 1)[-1]].append((name, left, right))
-            approx = left @ right
-            error += float((delta - approx).square().sum())
+            error += float((delta - left @ right).square().sum())
             energy += float(delta.square().sum())
             raw_target_bytes += tw.numel() * 2
 
-    tensors = {}
+    tensors: dict[str, torch.Tensor] = {}
     module_entries = {}
     for module, items in grouped.items():
         sketches = torch.stack([torch.cat([l.mean(0), r.mean(1)]) for _, l, r in items])
@@ -108,7 +104,15 @@ def build_sun(config: BuildConfig) -> Path:
         module_entries[module] = entries
 
     nmse = error / max(energy, 1e-12)
-    manifest = SunManifest(base_model=config.base_model, target_model=config.target_model, modules=list(config.modules), rank=config.rank, prototypes_per_module=config.prototypes_per_module, metadata={"module_entries": module_entries, "svd_delta_nmse": nmse, "raw_target_bytes": raw_target_bytes})
+    metadata = {
+        "task": base_adapter.task,
+        "base_model_type": getattr(base_cfg, "model_type", "unknown"),
+        "target_model_type": getattr(target_cfg, "model_type", "unknown"),
+        "module_entries": module_entries,
+        "svd_delta_nmse": nmse,
+        "raw_target_bytes": raw_target_bytes,
+    }
+    manifest = SunManifest(base_model=config.base_model, target_model=config.target_model, modules=list(selected_modules), rank=config.rank, prototypes_per_module=config.prototypes_per_module, metadata=metadata)
     out = SunArchive.write(config.output, manifest, tensors)
     ratio = out.stat().st_size / max(raw_target_bytes, 1)
     manifest.metadata.update(artifact_bytes=out.stat().st_size, distribution_ratio=ratio)

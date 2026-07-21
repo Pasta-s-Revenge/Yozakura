@@ -6,6 +6,7 @@ from dataclasses import asdict
 
 import torch
 
+from .adapters import ADAPTERS, resolve_adapter
 from .archive import SunArchive
 from .builder import BuildConfig, build_sun
 from .runtime import load_sun_model
@@ -18,13 +19,14 @@ def _parser() -> argparse.ArgumentParser:
     b.add_argument("--base", required=True)
     b.add_argument("--target", required=True)
     b.add_argument("--output", required=True)
-    b.add_argument("--modules", default="gate_proj,up_proj,down_proj")
+    b.add_argument("--modules", default="auto", help="Comma-separated linear suffixes or auto")
+    b.add_argument("--task", default="auto", choices=["auto", *ADAPTERS])
     b.add_argument("--rank", type=int, default=32)
     b.add_argument("--prototypes", type=int, default=4)
     b.add_argument("--max-layers", type=int)
     b.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     b.add_argument("--trust-remote-code", action="store_true")
-    r = sub.add_parser("run", help="Run text generation from a .sun archive")
+    r = sub.add_parser("run", help="Run generation from a generative .sun archive")
     r.add_argument("archive")
     r.add_argument("--prompt", required=True)
     r.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
@@ -32,24 +34,37 @@ def _parser() -> argparse.ArgumentParser:
     r.add_argument("--trust-remote-code", action="store_true")
     i = sub.add_parser("inspect", help="Print the .sun manifest")
     i.add_argument("archive")
+    s = sub.add_parser("probe", help="Resolve a Hugging Face model task without loading weights")
+    s.add_argument("model")
+    s.add_argument("--task", default="auto", choices=["auto", *ADAPTERS])
+    s.add_argument("--trust-remote-code", action="store_true")
     return p
 
 
 def main() -> None:
     args = _parser().parse_args()
     if args.command == "build":
-        path = build_sun(BuildConfig(base_model=args.base, target_model=args.target, output=args.output, modules=tuple(x.strip() for x in args.modules.split(",") if x.strip()), rank=args.rank, prototypes_per_module=args.prototypes, max_layers=args.max_layers, device=args.device, trust_remote_code=args.trust_remote_code))
+        modules = None if args.modules == "auto" else tuple(x.strip() for x in args.modules.split(",") if x.strip())
+        path = build_sun(BuildConfig(base_model=args.base, target_model=args.target, output=args.output, modules=modules, task=args.task, rank=args.rank, prototypes_per_module=args.prototypes, max_layers=args.max_layers, device=args.device, trust_remote_code=args.trust_remote_code))
         print(path)
     elif args.command == "inspect":
         manifest, _ = SunArchive.read(args.archive)
         print(json.dumps(asdict(manifest), ensure_ascii=False, indent=2, default=str))
+    elif args.command == "probe":
+        adapter, config = resolve_adapter(args.model, args.task, trust_remote_code=args.trust_remote_code)
+        print(json.dumps({"model": args.model, "model_type": getattr(config, "model_type", None), "task": adapter.task, "generative": adapter.generative, "model_class": adapter.model_class.__name__}, indent=2))
     else:
+        manifest, _ = SunArchive.read(args.archive)
+        task = str(manifest.metadata.get("task", "causal-lm"))
+        adapter, _ = resolve_adapter(manifest.base_model, task, trust_remote_code=args.trust_remote_code)
+        if not adapter.generative:
+            raise SystemExit(f"Task {task!r} is not generative; use load_sun_model() from Python")
         dtype = torch.float32 if args.device == "cpu" else torch.float16
-        model, tokenizer = load_sun_model(args.archive, device=args.device, dtype=dtype, trust_remote_code=args.trust_remote_code)
-        inputs = tokenizer(args.prompt, return_tensors="pt").to(args.device)
+        model, frontend = load_sun_model(args.archive, device=args.device, dtype=dtype, trust_remote_code=args.trust_remote_code)
+        inputs = frontend(args.prompt, return_tensors="pt").to(args.device)
         with torch.inference_mode():
             output = model.generate(**inputs, max_new_tokens=args.max_new_tokens)
-        print(tokenizer.decode(output[0], skip_special_tokens=True))
+        print(frontend.decode(output[0], skip_special_tokens=True) if hasattr(frontend, "decode") else output)
 
 
 if __name__ == "__main__":

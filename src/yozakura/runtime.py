@@ -4,8 +4,8 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .adapters import load_frontend, resolve_adapter
 from .archive import SunArchive
 from .codec import dequantize_symmetric
 
@@ -43,7 +43,9 @@ def load_sun_model(sun_path: str, *, device: str = "cpu", dtype: torch.dtype | N
     manifest, _ = SunArchive.read(sun_path)
     if dtype is None:
         dtype = torch.float32 if device == "cpu" else torch.float16
-    model = AutoModelForCausalLM.from_pretrained(manifest.base_model, torch_dtype=dtype, low_cpu_mem_usage=True, trust_remote_code=trust_remote_code, **model_kwargs).to(device).eval()
+    task = str(manifest.metadata.get("task", "causal-lm"))
+    adapter, _ = resolve_adapter(manifest.base_model, task, trust_remote_code=trust_remote_code)
+    model = adapter.model_class.from_pretrained(manifest.base_model, torch_dtype=dtype, low_cpu_mem_usage=True, trust_remote_code=trust_remote_code, **model_kwargs).to(device).eval()
     apply_sun(model, sun_path)
-    tokenizer = AutoTokenizer.from_pretrained(manifest.target_model, trust_remote_code=trust_remote_code)
-    return model, tokenizer
+    frontend = load_frontend(adapter, manifest.target_model, trust_remote_code=trust_remote_code)
+    return model, frontend
