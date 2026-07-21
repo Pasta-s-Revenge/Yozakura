@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch.nn as nn
+import transformers
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -14,9 +15,27 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoModelForSequenceClassification,
     AutoModelForSpeechSeq2Seq,
-    AutoModelForVision2Seq,
     AutoProcessor,
     AutoTokenizer,
+)
+
+
+def _first_transformers_class(*names: str, fallback: type) -> type:
+    """Resolve renamed optional AutoModel classes without import-time failure."""
+    for name in names:
+        candidate = getattr(transformers, name, None)
+        if candidate is not None:
+            return candidate
+    return fallback
+
+
+# Transformers renamed/removed vision-language AutoModel aliases across major
+# versions. Resolve them lazily instead of importing one unstable symbol.
+AutoModelForMultimodal = _first_transformers_class(
+    "AutoModelForImageTextToText",
+    "AutoModelForMultimodalLM",
+    "AutoModelForVision2Seq",
+    fallback=AutoModel,
 )
 
 
@@ -34,7 +53,7 @@ ADAPTERS: dict[str, HFAdapter] = {
     "masked-lm": HFAdapter("masked-lm", AutoModelForMaskedLM, AutoTokenizer, False),
     "sequence-classification": HFAdapter("sequence-classification", AutoModelForSequenceClassification, AutoTokenizer, False),
     "image-classification": HFAdapter("image-classification", AutoModelForImageClassification, AutoProcessor, False),
-    "vision2seq": HFAdapter("vision2seq", AutoModelForVision2Seq, AutoProcessor, True),
+    "vision2seq": HFAdapter("vision2seq", AutoModelForMultimodal, AutoProcessor, True),
     "speech-seq2seq": HFAdapter("speech-seq2seq", AutoModelForSpeechSeq2Seq, AutoProcessor, True),
     "base": HFAdapter("base", AutoModel, AutoProcessor, False),
 }
@@ -54,6 +73,8 @@ FAMILY_TASK_HINTS: dict[str, str] = {
     "convnext": "image-classification", "whisper": "speech-seq2seq",
     "vision-encoder-decoder": "vision2seq", "llava": "vision2seq",
     "idefics": "vision2seq", "clip": "base", "siglip": "base",
+    "qwen3_5": "vision2seq", "qwen3_5_moe": "vision2seq",
+    "qwen2_vl": "vision2seq", "qwen2_5_vl": "vision2seq", "qwen3_vl": "vision2seq",
 }
 
 
@@ -71,9 +92,15 @@ def resolve_adapter(model_id: str, task: str = "auto", *, trust_remote_code: boo
         return ADAPTERS["seq2seq-lm"], config
     architectures = " ".join(getattr(config, "architectures", None) or [])
     for needle, candidate in (
-        ("ForCausalLM", "causal-lm"), ("ForConditionalGeneration", "seq2seq-lm"),
-        ("ForMaskedLM", "masked-lm"), ("ForSequenceClassification", "sequence-classification"),
-        ("ForImageClassification", "image-classification"), ("ForSpeechSeq2Seq", "speech-seq2seq"),
+        ("ForCausalLM", "causal-lm"),
+        ("ForImageTextToText", "vision2seq"),
+        ("ForVision2Seq", "vision2seq"),
+        ("ForMultimodal", "vision2seq"),
+        ("ForConditionalGeneration", "vision2seq" if hasattr(config, "vision_config") else "seq2seq-lm"),
+        ("ForMaskedLM", "masked-lm"),
+        ("ForSequenceClassification", "sequence-classification"),
+        ("ForImageClassification", "image-classification"),
+        ("ForSpeechSeq2Seq", "speech-seq2seq"),
     ):
         if needle in architectures:
             return ADAPTERS[candidate], config
@@ -88,7 +115,6 @@ def matching_linears(base: nn.Module, target: nn.Module, modules: tuple[str, ...
         common = {n for n in common if n.rsplit(".", 1)[-1] in modules}
         selected = modules
     else:
-        # Keep repeated transformer block projections; omit one-off heads by default.
         counts = Counter(n.rsplit(".", 1)[-1] for n in common)
         selected = tuple(sorted(s for s, count in counts.items() if count >= 2))
         common = {n for n in common if n.rsplit(".", 1)[-1] in selected}
