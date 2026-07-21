@@ -1,0 +1,83 @@
+name: AI model support survey
+about: Request and prioritize a Hugging Face model or architecture
+labels: [model-support, survey]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this survey when `yozakura probe MODEL_ID` cannot resolve the model correctly, or a `.sun` build fails because the architecture needs a dedicated adapter.
+  - type: input
+    id: model
+    attributes:
+      label: Hugging Face model ID
+      description: Use the exact owner/model repository ID.
+      placeholder: meta-llama/Llama-3.1-8B-Instruct
+    validations:
+      required: true
+  - type: dropdown
+    id: task
+    attributes:
+      label: Primary task
+      options:
+        - Causal language generation
+        - Encoder-decoder generation
+        - Masked language modeling
+        - Text classification
+        - Image classification
+        - Vision-language generation
+        - Speech-to-text generation
+        - Embeddings/base model
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Why should this be prioritized?
+      options:
+        - Widely used foundation model
+        - Important open-source model
+        - Required for a production project
+        - Research or benchmark coverage
+        - Accessibility / CPU inference
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: probe
+    attributes:
+      label: Probe or build output
+      description: Paste `yozakura probe MODEL_ID` output and the smallest relevant error. Remove tokens and private paths.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: base_target
+    attributes:
+      label: Base and target relationship
+      description: For a delta build, identify the base model and explain why tensor shapes should match.
+      placeholder: Base: owner/base-model\nTarget: owner/fine-tuned-model\nRelationship: ...
+  - type: checkboxes
+    id: environment
+    attributes:
+      label: Required runtimes
+      options:
+        - label: CPU
+        - label: CUDA GPU
+        - label: Apple Silicon / MPS
+        - label: Multimodal processor
+        - label: Offline/local-only execution
+  - type: textarea
+    id: license
+    attributes:
+      label: License and redistribution notes
+      description: Include model-card license restrictions that affect `.sun` distribution.
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I verified the exact model ID and searched existing issues.
+          required: true
+        - label: I understand that model support does not override the upstream model license.
+          required: true
