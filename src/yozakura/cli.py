@@ -9,7 +9,7 @@ import torch
 from .adapters import ADAPTERS, resolve_adapter
 from .archive import SunArchive
 from .builder import BuildConfig, build_sun
-from .runtime import load_sun_model
+from .runtime import DEFAULT_WORKSPACE_MIB, load_sun_model
 
 
 DTYPES = {
@@ -42,6 +42,12 @@ def _parser() -> argparse.ArgumentParser:
     r.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     r.add_argument("--dtype", choices=DTYPES, default="float16", help="Model dtype; float16 minimizes RAM")
     r.add_argument("--max-new-tokens", type=int, default=128)
+    r.add_argument(
+        "--workspace-mib",
+        type=int,
+        default=DEFAULT_WORKSPACE_MIB,
+        help="Maximum temporary MiB used while reconstructing each projection",
+    )
     r.add_argument("--skip-checksum", action="store_true", help="Skip .sun SHA-256 verification for faster startup")
     r.add_argument("--trust-remote-code", action="store_true")
     i = sub.add_parser("inspect", help="Print the .sun manifest")
@@ -94,6 +100,8 @@ def main() -> None:
         adapter, config = resolve_adapter(args.model, args.task, trust_remote_code=args.trust_remote_code)
         print(json.dumps({"model": args.model, "model_type": getattr(config, "model_type", None), "task": adapter.task, "generative": adapter.generative, "model_class": adapter.model_class.__name__}, indent=2))
     else:
+        if args.workspace_mib < 1:
+            raise SystemExit("--workspace-mib must be positive")
         manifest = SunArchive.read_manifest(args.archive)
         task = str(manifest.metadata.get("task", "causal-lm"))
         adapter, _ = resolve_adapter(manifest.base_model, task, trust_remote_code=args.trust_remote_code)
@@ -105,6 +113,7 @@ def main() -> None:
             dtype=DTYPES[args.dtype],
             trust_remote_code=args.trust_remote_code,
             verify_archive=not args.skip_checksum,
+            workspace_mib=args.workspace_mib,
         )
         inputs = frontend(args.prompt, return_tensors="pt").to(args.device)
         with torch.inference_mode():
