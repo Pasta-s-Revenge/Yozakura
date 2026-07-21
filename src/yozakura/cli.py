@@ -9,7 +9,7 @@ import torch
 from .adapters import ADAPTERS, resolve_adapter
 from .archive import SunArchive
 from .builder import BuildConfig, build_sun
-from .runtime import DEFAULT_WORKSPACE_MIB, load_sun_model
+from .runtime import DEFAULT_WORKSPACE_MIB, load_sun_model, model_input_device
 
 
 DTYPES = {
@@ -39,7 +39,7 @@ def _parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="Run generation from a generative .sun archive")
     r.add_argument("archive")
     r.add_argument("--prompt", required=True)
-    r.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    r.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
     r.add_argument("--dtype", choices=DTYPES, default="float16", help="Model dtype; float16 minimizes RAM")
     r.add_argument("--max-new-tokens", type=int, default=128)
     r.add_argument(
@@ -48,6 +48,14 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_WORKSPACE_MIB,
         help="Maximum temporary MiB used while reconstructing each projection",
     )
+    r.add_argument(
+        "--max-memory",
+        action="append",
+        default=[],
+        metavar="DEVICE=LIMIT",
+        help="Tier budget, e.g. 0=8GiB or cpu=24GiB; repeat per device",
+    )
+    r.add_argument("--offload-folder", help="Directory for disk-offloaded model modules")
     r.add_argument("--skip-checksum", action="store_true", help="Skip .sun SHA-256 verification for faster startup")
     r.add_argument("--trust-remote-code", action="store_true")
     i = sub.add_parser("inspect", help="Print the .sun manifest")
@@ -69,6 +77,20 @@ def _parse_modules(value: str) -> tuple[str, ...] | None:
     if not modules:
         raise SystemExit("--modules must be auto, all, or a comma-separated suffix list")
     return modules
+
+
+def _parse_max_memory(values: list[str]) -> dict[int | str, str] | None:
+    if not values:
+        return None
+    parsed: dict[int | str, str] = {}
+    for value in values:
+        key, separator, limit = value.partition("=")
+        key, limit = key.strip(), limit.strip()
+        if not separator or not key or not limit:
+            raise SystemExit("--max-memory must use DEVICE=LIMIT, for example 0=8GiB")
+        device: int | str = int(key) if key.isdigit() else key
+        parsed[device] = limit
+    return parsed
 
 
 def main() -> None:
@@ -102,6 +124,8 @@ def main() -> None:
     else:
         if args.workspace_mib < 1:
             raise SystemExit("--workspace-mib must be positive")
+        if args.device != "auto" and (args.max_memory or args.offload_folder):
+            raise SystemExit("--max-memory and --offload-folder require --device auto")
         manifest = SunArchive.read_manifest(args.archive)
         task = str(manifest.metadata.get("task", "causal-lm"))
         adapter, _ = resolve_adapter(manifest.base_model, task, trust_remote_code=args.trust_remote_code)
@@ -114,8 +138,10 @@ def main() -> None:
             trust_remote_code=args.trust_remote_code,
             verify_archive=not args.skip_checksum,
             workspace_mib=args.workspace_mib,
+            max_memory=_parse_max_memory(args.max_memory),
+            offload_folder=args.offload_folder,
         )
-        inputs = frontend(args.prompt, return_tensors="pt").to(args.device)
+        inputs = frontend(args.prompt, return_tensors="pt").to(model_input_device(model))
         with torch.inference_mode():
             output = model.generate(**inputs, max_new_tokens=args.max_new_tokens)
         print(frontend.decode(output[0], skip_special_tokens=True) if hasattr(frontend, "decode") else output)

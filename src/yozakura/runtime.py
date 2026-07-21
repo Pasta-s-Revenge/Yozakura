@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
@@ -56,7 +57,6 @@ def _workspace_rows(
     if rank < 1:
         raise ValueError("rank must be positive")
     element_size = torch.empty((), dtype=dtype).element_size()
-    # Two left-factor chunks coexist briefly: prototype and residual.
     bytes_per_row = max(2 * rank * element_size, 1)
     return max(1, min(output_rows, workspace_mib * 1024 * 1024 // bytes_per_row))
 
@@ -68,12 +68,7 @@ def apply_sun(
     verify_archive: bool = True,
     workspace_mib: int = DEFAULT_WORKSPACE_MIB,
 ) -> nn.Module:
-    """Apply a SUN delta with bounded reconstruction workspace.
-
-    The low-rank right factor is kept resident because it is small. The larger
-    left factor is decoded and multiplied in row chunks, so peak temporary
-    memory is controlled by ``workspace_mib`` rather than projection size.
-    """
+    """Apply a SUN delta with bounded reconstruction workspace."""
     with SunArchive.open_tensors(sun_path, verify=verify_archive) as (manifest, tensors):
         entries = manifest.metadata.get("module_entries", {})
         with torch.no_grad():
@@ -85,6 +80,11 @@ def apply_sun(
                     weight = getattr(projection, "weight", None)
                     if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
                         raise TypeError(f"Expected a module with a 2D weight at {name}")
+                    if weight.device.type == "meta":
+                        raise RuntimeError(
+                            f"Cannot apply SUN delta to offloaded meta weight at {name}; "
+                            "apply the archive before model dispatch"
+                        )
                     device, dtype = weight.device, weight.dtype
 
                     def dq(prefix: str) -> torch.Tensor:
@@ -144,6 +144,44 @@ def apply_sun(
     return model
 
 
+def _dispatch_model(
+    model: nn.Module,
+    *,
+    max_memory: Mapping[int | str, int | str] | None,
+    offload_folder: str | None,
+) -> nn.Module:
+    """Dispatch a reconstructed model across GPU, CPU, and optionally disk."""
+    try:
+        from accelerate import dispatch_model, infer_auto_device_map
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise RuntimeError("Tiered offload requires accelerate>=1.0") from exc
+
+    if offload_folder is not None:
+        Path(offload_folder).mkdir(parents=True, exist_ok=True)
+
+    device_map = infer_auto_device_map(model, max_memory=dict(max_memory) if max_memory else None)
+    return dispatch_model(
+        model,
+        device_map=device_map,
+        offload_dir=offload_folder,
+        offload_buffers=True,
+    )
+
+
+def model_input_device(model: nn.Module) -> torch.device:
+    """Return the device expected by the model's input embedding layer."""
+    get_embeddings = getattr(model, "get_input_embeddings", None)
+    if callable(get_embeddings):
+        embeddings = get_embeddings()
+        weight = getattr(embeddings, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.device.type != "meta":
+            return weight.device
+    for parameter in model.parameters():
+        if parameter.device.type != "meta":
+            return parameter.device
+    return torch.device("cpu")
+
+
 def load_sun_model(
     sun_path: str,
     *,
@@ -152,8 +190,17 @@ def load_sun_model(
     trust_remote_code: bool = False,
     verify_archive: bool = True,
     workspace_mib: int = DEFAULT_WORKSPACE_MIB,
+    max_memory: Mapping[int | str, int | str] | None = None,
+    offload_folder: str | None = None,
     **model_kwargs: Any,
 ):
+    """Load, reconstruct, and optionally tier a SUN model.
+
+    ``device='auto'`` reconstructs the model on CPU first, then lets Accelerate
+    place complete modules across GPU, CPU RAM, and disk according to
+    ``max_memory``. This bounds accelerator residency, but the reconstructed
+    base model must still fit in host RAM during the initial load in this phase.
+    """
     manifest = SunArchive.read_manifest(sun_path)
     if dtype is None:
         dtype = torch.float16
@@ -165,12 +212,18 @@ def load_sun_model(
         low_cpu_mem_usage=True,
         trust_remote_code=trust_remote_code,
         **model_kwargs,
-    ).to(device).eval()
+    ).eval()
+
+    if device != "auto":
+        model = model.to(device)
     apply_sun(
         model,
         sun_path,
         verify_archive=verify_archive,
         workspace_mib=workspace_mib,
     )
+    if device == "auto":
+        model = _dispatch_model(model, max_memory=max_memory, offload_folder=offload_folder)
+
     frontend = load_frontend(adapter, manifest.target_model, trust_remote_code=trust_remote_code)
     return model, frontend
