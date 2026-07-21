@@ -39,7 +39,7 @@ def _parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="Run generation from a generative .sun archive")
     r.add_argument("archive")
     r.add_argument("--prompt", required=True)
-    r.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
+    r.add_argument("--device", choices=["cpu", "cuda", "auto", "out-of-core"], default="cpu")
     r.add_argument("--dtype", choices=DTYPES, default="float16", help="Model dtype; float16 minimizes RAM")
     r.add_argument("--max-new-tokens", type=int, default=128)
     r.add_argument(
@@ -56,6 +56,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Tier budget, e.g. 0=8GiB or cpu=24GiB; repeat per device",
     )
     r.add_argument("--offload-folder", help="Directory for disk-offloaded model modules")
+    r.add_argument(
+        "--checkpoint-cache",
+        default=".yozakura-checkpoints",
+        help="Cache for reconstructed out-of-core SafeTensors checkpoints",
+    )
+    r.add_argument("--revision", help="Optional Hugging Face base-model revision")
+    r.add_argument("--local-files-only", action="store_true", help="Do not download missing base-model files")
     r.add_argument("--skip-checksum", action="store_true", help="Skip .sun SHA-256 verification for faster startup")
     r.add_argument("--trust-remote-code", action="store_true")
     i = sub.add_parser("inspect", help="Print the .sun manifest")
@@ -124,8 +131,8 @@ def main() -> None:
     else:
         if args.workspace_mib < 1:
             raise SystemExit("--workspace-mib must be positive")
-        if args.device != "auto" and (args.max_memory or args.offload_folder):
-            raise SystemExit("--max-memory and --offload-folder require --device auto")
+        if args.device not in {"auto", "out-of-core"} and (args.max_memory or args.offload_folder):
+            raise SystemExit("--max-memory and --offload-folder require --device auto or out-of-core")
         manifest = SunArchive.read_manifest(args.archive)
         task = str(manifest.metadata.get("task", "causal-lm"))
         adapter, _ = resolve_adapter(manifest.base_model, task, trust_remote_code=args.trust_remote_code)
@@ -140,6 +147,9 @@ def main() -> None:
             workspace_mib=args.workspace_mib,
             max_memory=_parse_max_memory(args.max_memory),
             offload_folder=args.offload_folder,
+            checkpoint_cache=args.checkpoint_cache,
+            revision=args.revision,
+            local_files_only=args.local_files_only,
         )
         inputs = frontend(args.prompt, return_tensors="pt").to(model_input_device(model))
         with torch.inference_mode():
