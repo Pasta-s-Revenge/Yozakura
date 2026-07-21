@@ -19,6 +19,11 @@ from transformers import (
     AutoTokenizer,
 )
 
+try:
+    from transformers.pytorch_utils import Conv1D
+except ImportError:  # pragma: no cover - compatibility fallback
+    Conv1D = ()  # type: ignore[assignment,misc]
+
 
 def _first_transformers_class(*names: str, fallback: type) -> type:
     """Resolve renamed optional AutoModel classes without import-time failure."""
@@ -29,8 +34,6 @@ def _first_transformers_class(*names: str, fallback: type) -> type:
     return fallback
 
 
-# Transformers renamed/removed vision-language AutoModel aliases across major
-# versions. Resolve them lazily instead of importing one unstable symbol.
 AutoModelForMultimodal = _first_transformers_class(
     "AutoModelForImageTextToText",
     "AutoModelForMultimodalLM",
@@ -58,8 +61,6 @@ ADAPTERS: dict[str, HFAdapter] = {
     "base": HFAdapter("base", AutoModel, AutoProcessor, False),
 }
 
-# Coverage aliases are informational. Actual compatibility is established by
-# AutoConfig + AutoModel registration and matching linear tensor paths.
 FAMILY_TASK_HINTS: dict[str, str] = {
     "llama": "causal-lm", "mistral": "causal-lm", "mixtral": "causal-lm",
     "qwen2": "causal-lm", "qwen3": "causal-lm", "gemma": "causal-lm",
@@ -107,17 +108,34 @@ def resolve_adapter(model_id: str, task: str = "auto", *, trust_remote_code: boo
     return ADAPTERS["base"], config
 
 
-def matching_linears(base: nn.Module, target: nn.Module, modules: tuple[str, ...] | None = None) -> tuple[dict[str, nn.Linear], dict[str, nn.Linear], tuple[str, ...]]:
-    base_all = {n: m for n, m in base.named_modules() if isinstance(m, nn.Linear)}
-    target_all = {n: m for n, m in target.named_modules() if isinstance(m, nn.Linear)}
-    common = {n for n in base_all.keys() & target_all.keys() if base_all[n].weight.shape == target_all[n].weight.shape}
-    if modules:
+def _is_projection(module: nn.Module) -> bool:
+    """Return true for standard Linear and GPT-style Conv1D projections."""
+    return isinstance(module, nn.Linear) or (Conv1D and isinstance(module, Conv1D))
+
+
+def matching_linears(
+    base: nn.Module,
+    target: nn.Module,
+    modules: tuple[str, ...] | None = None,
+) -> tuple[dict[str, nn.Module], dict[str, nn.Module], tuple[str, ...]]:
+    base_all = {n: m for n, m in base.named_modules() if _is_projection(m)}
+    target_all = {n: m for n, m in target.named_modules() if _is_projection(m)}
+    common = {
+        n for n in base_all.keys() & target_all.keys()
+        if base_all[n].weight.ndim == 2
+        and base_all[n].weight.shape == target_all[n].weight.shape
+    }
+
+    if modules == ("*",):
+        selected = tuple(sorted({n.rsplit(".", 1)[-1] for n in common}))
+    elif modules:
         common = {n for n in common if n.rsplit(".", 1)[-1] in modules}
         selected = modules
     else:
         counts = Counter(n.rsplit(".", 1)[-1] for n in common)
         selected = tuple(sorted(s for s, count in counts.items() if count >= 2))
         common = {n for n in common if n.rsplit(".", 1)[-1] in selected}
+
     return ({n: base_all[n] for n in common}, {n: target_all[n] for n in common}, selected)
 
 

@@ -25,27 +25,49 @@ def apply_sun(model: nn.Module, sun_path: str) -> nn.Module:
             for row in rows:
                 name = str(row["name"])
                 p = int(row["prototype"])
-                linear = _module_by_name(model, name)
-                if not isinstance(linear, nn.Linear):
-                    raise TypeError(f"Expected nn.Linear at {name}")
-                device, dtype = linear.weight.device, linear.weight.dtype
+                projection = _module_by_name(model, name)
+                weight = getattr(projection, "weight", None)
+                if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+                    raise TypeError(f"Expected a module with a 2D weight at {name}")
+                device, dtype = weight.device, weight.dtype
 
                 def dq(prefix: str) -> torch.Tensor:
-                    return dequantize_symmetric(tensors[prefix + ".q"], tensors[prefix + ".scale"], device=device, dtype=dtype)
+                    return dequantize_symmetric(
+                        tensors[prefix + ".q"],
+                        tensors[prefix + ".scale"],
+                        device=device,
+                        dtype=dtype,
+                    )
 
                 left = dq(f"prototypes/{module_name}/{p}/left") + dq(f"layers/{name}/left_residual")
                 right = dq(f"prototypes/{module_name}/{p}/right") + dq(f"layers/{name}/right_residual")
-                linear.weight.add_(left @ right)
+                delta = left @ right
+                if delta.shape != weight.shape:
+                    raise ValueError(f"Reconstructed delta shape mismatch at {name}: {delta.shape} != {weight.shape}")
+                weight.add_(delta)
     return model
 
 
-def load_sun_model(sun_path: str, *, device: str = "cpu", dtype: torch.dtype | None = None, trust_remote_code: bool = False, **model_kwargs: Any):
+def load_sun_model(
+    sun_path: str,
+    *,
+    device: str = "cpu",
+    dtype: torch.dtype | None = None,
+    trust_remote_code: bool = False,
+    **model_kwargs: Any,
+):
     manifest, _ = SunArchive.read(sun_path)
     if dtype is None:
         dtype = torch.float32 if device == "cpu" else torch.float16
     task = str(manifest.metadata.get("task", "causal-lm"))
     adapter, _ = resolve_adapter(manifest.base_model, task, trust_remote_code=trust_remote_code)
-    model = adapter.model_class.from_pretrained(manifest.base_model, torch_dtype=dtype, low_cpu_mem_usage=True, trust_remote_code=trust_remote_code, **model_kwargs).to(device).eval()
+    model = adapter.model_class.from_pretrained(
+        manifest.base_model,
+        dtype=dtype,
+        low_cpu_mem_usage=True,
+        trust_remote_code=trust_remote_code,
+        **model_kwargs,
+    ).to(device).eval()
     apply_sun(model, sun_path)
     frontend = load_frontend(adapter, manifest.target_model, trust_remote_code=trust_remote_code)
     return model, frontend
