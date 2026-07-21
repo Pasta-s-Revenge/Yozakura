@@ -19,7 +19,7 @@ def _parser() -> argparse.ArgumentParser:
     b.add_argument("--base", required=True)
     b.add_argument("--target", required=True)
     b.add_argument("--output", required=True)
-    b.add_argument("--modules", default="auto", help="Comma-separated linear suffixes or auto")
+    b.add_argument("--modules", default="auto", help="Comma-separated projection suffixes, auto, or all")
     b.add_argument("--task", default="auto", choices=["auto", *ADAPTERS])
     b.add_argument("--rank", type=int, default=32)
     b.add_argument("--prototypes", type=int, default=4)
@@ -41,10 +41,22 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _parse_modules(value: str) -> tuple[str, ...] | None:
+    normalized = value.strip().lower()
+    if normalized == "auto":
+        return None
+    if normalized in {"all", "*"}:
+        return ("*",)
+    modules = tuple(x.strip() for x in value.split(",") if x.strip())
+    if not modules:
+        raise SystemExit("--modules must be auto, all, or a comma-separated suffix list")
+    return modules
+
+
 def main() -> None:
     args = _parser().parse_args()
     if args.command == "build":
-        modules = None if args.modules == "auto" else tuple(x.strip() for x in args.modules.split(",") if x.strip())
+        modules = _parse_modules(args.modules)
         path = build_sun(BuildConfig(base_model=args.base, target_model=args.target, output=args.output, modules=modules, task=args.task, rank=args.rank, prototypes_per_module=args.prototypes, max_layers=args.max_layers, device=args.device, trust_remote_code=args.trust_remote_code))
         print(path)
     elif args.command == "inspect":
