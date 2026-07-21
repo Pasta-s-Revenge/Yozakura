@@ -38,7 +38,7 @@ def _linux_memory_kib(field: str) -> int | None:
 
 def _dtype(name: str, device: str) -> torch.dtype:
     if name == "auto":
-        return torch.float16 if device == "cuda" else torch.float32
+        return torch.float16
     mapping = {
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
@@ -106,7 +106,7 @@ def _prompt_quality(model: torch.nn.Module, inputs: Any) -> dict[str, Any]:
 
 def _load_worker_model(args: argparse.Namespace):
     dtype = _dtype(args.dtype, args.device)
-    manifest, _ = SunArchive.read(args.archive)
+    manifest = SunArchive.read_manifest(args.archive)
     if args.worker_mode == "sun":
         return load_sun_model(
             args.archive,
@@ -277,7 +277,7 @@ def main() -> None:
         return
 
     archive = Path(args.archive)
-    manifest, _ = SunArchive.read(archive)
+    manifest = SunArchive.read_manifest(archive)
     sun = _run_isolated(args, "sun")
     target = _run_isolated(args, "target") if args.compare_target else None
 
