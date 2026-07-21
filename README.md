@@ -1,4 +1,5 @@
-# Yozakura
+# Yozakura　🌸　夜桜　
+<img width="1983" height="793" alt="image" src="https://github.com/user-attachments/assets/e5cb7a54-974d-4853-9e74-789e45046294" />
 
 Yozakura is a portable hypernetwork framework for CPU/GPU Transformers inference. It introduces `.sun` (Shared Universal Network), a deterministic archive containing a quantized low-rank hypernetwork delta and a reference to its base model.
 
