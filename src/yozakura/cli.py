@@ -12,6 +12,13 @@ from .builder import BuildConfig, build_sun
 from .runtime import load_sun_model
 
 
+DTYPES = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="yozakura")
     sub = p.add_subparsers(dest="command", required=True)
@@ -25,12 +32,17 @@ def _parser() -> argparse.ArgumentParser:
     b.add_argument("--prototypes", type=int, default=4)
     b.add_argument("--max-layers", type=int)
     b.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    b.add_argument("--dtype", choices=DTYPES, default="float16", help="Model load dtype; float16 minimizes RAM")
+    b.add_argument("--svd-oversample", type=int, default=8)
+    b.add_argument("--error-chunk-rows", type=int, default=256)
     b.add_argument("--trust-remote-code", action="store_true")
     r = sub.add_parser("run", help="Run generation from a generative .sun archive")
     r.add_argument("archive")
     r.add_argument("--prompt", required=True)
     r.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    r.add_argument("--dtype", choices=DTYPES, default="float16", help="Model dtype; float16 minimizes RAM")
     r.add_argument("--max-new-tokens", type=int, default=128)
+    r.add_argument("--skip-checksum", action="store_true", help="Skip .sun SHA-256 verification for faster startup")
     r.add_argument("--trust-remote-code", action="store_true")
     i = sub.add_parser("inspect", help="Print the .sun manifest")
     i.add_argument("archive")
@@ -57,22 +69,43 @@ def main() -> None:
     args = _parser().parse_args()
     if args.command == "build":
         modules = _parse_modules(args.modules)
-        path = build_sun(BuildConfig(base_model=args.base, target_model=args.target, output=args.output, modules=modules, task=args.task, rank=args.rank, prototypes_per_module=args.prototypes, max_layers=args.max_layers, device=args.device, trust_remote_code=args.trust_remote_code))
+        path = build_sun(
+            BuildConfig(
+                base_model=args.base,
+                target_model=args.target,
+                output=args.output,
+                modules=modules,
+                task=args.task,
+                rank=args.rank,
+                prototypes_per_module=args.prototypes,
+                max_layers=args.max_layers,
+                device=args.device,
+                dtype=DTYPES[args.dtype],
+                trust_remote_code=args.trust_remote_code,
+                svd_oversample=args.svd_oversample,
+                error_chunk_rows=args.error_chunk_rows,
+            )
+        )
         print(path)
     elif args.command == "inspect":
-        manifest, _ = SunArchive.read(args.archive)
+        manifest = SunArchive.read_manifest(args.archive)
         print(json.dumps(asdict(manifest), ensure_ascii=False, indent=2, default=str))
     elif args.command == "probe":
         adapter, config = resolve_adapter(args.model, args.task, trust_remote_code=args.trust_remote_code)
         print(json.dumps({"model": args.model, "model_type": getattr(config, "model_type", None), "task": adapter.task, "generative": adapter.generative, "model_class": adapter.model_class.__name__}, indent=2))
     else:
-        manifest, _ = SunArchive.read(args.archive)
+        manifest = SunArchive.read_manifest(args.archive)
         task = str(manifest.metadata.get("task", "causal-lm"))
         adapter, _ = resolve_adapter(manifest.base_model, task, trust_remote_code=args.trust_remote_code)
         if not adapter.generative:
             raise SystemExit(f"Task {task!r} is not generative; use load_sun_model() from Python")
-        dtype = torch.float32 if args.device == "cpu" else torch.float16
-        model, frontend = load_sun_model(args.archive, device=args.device, dtype=dtype, trust_remote_code=args.trust_remote_code)
+        model, frontend = load_sun_model(
+            args.archive,
+            device=args.device,
+            dtype=DTYPES[args.dtype],
+            trust_remote_code=args.trust_remote_code,
+            verify_archive=not args.skip_checksum,
+        )
         inputs = frontend(args.prompt, return_tensors="pt").to(args.device)
         with torch.inference_mode():
             output = model.generate(**inputs, max_new_tokens=args.max_new_tokens)
