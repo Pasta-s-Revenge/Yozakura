@@ -197,16 +197,16 @@ def load_sun_model(
     local_files_only: bool = False,
     **model_kwargs: Any,
 ):
-    """Load a SUN model using eager, tiered, or fully out-of-core construction.
+    """Load a SUN model using eager, tiered, or bounded-memory construction.
 
-    ``device='out-of-core'`` never materializes the complete base model in host
-    RAM. It reconstructs a cached SafeTensors checkpoint one tensor at a time,
-    creates the model on the meta device, then loads it directly into the
-    inferred GPU/CPU/disk device map.
+    ``device='out-of-core'`` reconstructs one tensor at a time and dispatches the
+    model across available tiers. ``device='layer'`` additionally limits the
+    default CPU-resident weights to 1 GiB so Transformer blocks are streamed
+    from disk by Accelerate's forward hooks.
     """
     if dtype is None:
         dtype = torch.float16
-    if device == "out-of-core":
+    if device in {"out-of-core", "layer"}:
         if model_kwargs:
             unsupported = ", ".join(sorted(model_kwargs))
             raise ValueError(f"Out-of-core loading does not accept model kwargs yet: {unsupported}")
@@ -223,6 +223,7 @@ def load_sun_model(
             trust_remote_code=trust_remote_code,
             revision=revision,
             local_files_only=local_files_only,
+            layer_streaming=device == "layer",
         )
 
     manifest = SunArchive.read_manifest(sun_path)
