@@ -39,7 +39,12 @@ def _parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="Run generation from a generative .sun archive")
     r.add_argument("archive")
     r.add_argument("--prompt", required=True)
-    r.add_argument("--device", choices=["cpu", "cuda", "auto", "out-of-core"], default="cpu")
+    r.add_argument(
+        "--device",
+        choices=["cpu", "cuda", "auto", "out-of-core", "layer"],
+        default="cpu",
+        help="layer streams disk-offloaded Transformer blocks with minimal resident RAM",
+    )
     r.add_argument("--dtype", choices=DTYPES, default="float16", help="Model dtype; float16 minimizes RAM")
     r.add_argument("--max-new-tokens", type=int, default=128)
     r.add_argument(
@@ -53,7 +58,7 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="DEVICE=LIMIT",
-        help="Tier budget, e.g. 0=8GiB or cpu=24GiB; repeat per device",
+        help="Tier budget, e.g. 0=8GiB or cpu=24GiB; layer defaults to cpu=1GiB",
     )
     r.add_argument("--offload-folder", help="Directory for disk-offloaded model modules")
     r.add_argument(
@@ -131,8 +136,8 @@ def main() -> None:
     else:
         if args.workspace_mib < 1:
             raise SystemExit("--workspace-mib must be positive")
-        if args.device not in {"auto", "out-of-core"} and (args.max_memory or args.offload_folder):
-            raise SystemExit("--max-memory and --offload-folder require --device auto or out-of-core")
+        if args.device not in {"auto", "out-of-core", "layer"} and (args.max_memory or args.offload_folder):
+            raise SystemExit("--max-memory and --offload-folder require --device auto, out-of-core, or layer")
         manifest = SunArchive.read_manifest(args.archive)
         task = str(manifest.metadata.get("task", "causal-lm"))
         adapter, _ = resolve_adapter(manifest.base_model, task, trust_remote_code=args.trust_remote_code)
