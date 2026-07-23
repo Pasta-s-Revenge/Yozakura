@@ -17,6 +17,9 @@ from .checkpoint import ShardedCheckpoint
 from .codec import dequantize_symmetric
 
 
+LAYER_STREAMING_CPU_BUDGET = "1GiB"
+
+
 def _workspace_rows(*, output_rows: int, rank: int, dtype: torch.dtype, workspace_mib: int) -> int:
     if workspace_mib < 1:
         raise ValueError("workspace_mib must be positive")
@@ -103,6 +106,7 @@ def _patch_projection_weight(
                 )
             weight[start:stop].addmm_(left, right)
             del left
+    del right
     return weight
 
 
@@ -168,9 +172,7 @@ def materialize_sun_checkpoint(
             names = sorted(checkpoint.weight_map)
             width = max(6, len(str(len(names))))
             for index, name in enumerate(names, start=1):
-                value = checkpoint.tensor(name)
-                if value.is_floating_point():
-                    value = value.to(dtype=dtype)
+                value = checkpoint.tensor(name, dtype=dtype)
                 entry = sun_entries.get(name)
                 if entry is not None:
                     module_type, prototype, module_name = entry
@@ -233,8 +235,14 @@ def load_out_of_core_sun_model(
     trust_remote_code: bool = False,
     revision: str | None = None,
     local_files_only: bool = False,
+    layer_streaming: bool = False,
 ):
-    """Construct and load a SUN model without full host-RAM residency."""
+    """Construct and load a SUN model without full host-RAM residency.
+
+    In layer-streaming mode, the CPU weight budget defaults to 1 GiB and all
+    overflow modules are disk-offloaded. Accelerate hooks load each no-split
+    Transformer block for its forward pass and release it afterward.
+    """
     try:
         from accelerate import infer_auto_device_map, init_empty_weights, load_checkpoint_and_dispatch
     except ImportError as exc:  # pragma: no cover
@@ -265,9 +273,17 @@ def load_out_of_core_sun_model(
     model.eval()
 
     no_split = list(getattr(model, "_no_split_modules", None) or [])
+    effective_memory: dict[int | str, int | str] | None
+    if max_memory is not None:
+        effective_memory = dict(max_memory)
+    elif layer_streaming:
+        effective_memory = {"cpu": LAYER_STREAMING_CPU_BUDGET}
+    else:
+        effective_memory = None
+
     device_map = infer_auto_device_map(
         model,
-        max_memory=dict(max_memory) if max_memory else None,
+        max_memory=effective_memory,
         no_split_module_classes=no_split or None,
         dtype=dtype,
     )
@@ -279,7 +295,9 @@ def load_out_of_core_sun_model(
         device_map=device_map,
         offload_folder=offload_dir,
         offload_buffers=True,
+        offload_state_dict=True,
         dtype=dtype,
+        force_hooks=layer_streaming,
     ).eval()
     frontend = load_frontend(adapter, manifest.target_model, trust_remote_code=trust_remote_code)
     return model, frontend
