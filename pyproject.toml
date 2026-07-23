@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+standalone = ["pyinstaller>=6.10"]
 
 [project.scripts]
 yozakura = "yozakura.cli:main"
