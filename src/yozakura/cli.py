@@ -51,7 +51,10 @@ def _parser() -> argparse.ArgumentParser:
         "--device",
         choices=["cpu", "cuda", "auto", "out-of-core", "layer"],
         default="cpu",
-        help="layer streams disk-offloaded Transformer blocks with minimal resident RAM",
+        help=(
+            "layer streams disk-offloaded Transformer blocks with minimal resident RAM; "
+            "add --max-memory 0=LIMIT to keep a CUDA-resident layer budget"
+        ),
     )
     r.add_argument("--dtype", choices=DTYPES, default="float16", help="Model dtype; float16 minimizes RAM")
     r.add_argument("--max-new-tokens", type=int, default=128)
@@ -66,7 +69,10 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="DEVICE=LIMIT",
-        help="Tier budget, e.g. 0=8GiB or cpu=24GiB; layer defaults to cpu=1GiB",
+        help=(
+            "Tier budget, e.g. 0=8GiB or cpu=24GiB; "
+            "layer defaults to cpu=1GiB and accepts both GPU and CPU budgets"
+        ),
     )
     r.add_argument("--offload-folder", help="Directory for disk-offloaded model modules")
     r.add_argument(
