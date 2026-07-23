@@ -29,7 +29,7 @@ datas += collect_data_files("transformers", include_py_files=False)
 binaries += collect_dynamic_libs("torch")
 
 analysis = Analysis(
-    [str(ROOT / "src" / "yozakura" / "cli.py")],
+    [str(ROOT / "packaging" / "yozakura_entry.py")],
     pathex=[str(ROOT / "src")],
     binaries=binaries,
     datas=datas,
