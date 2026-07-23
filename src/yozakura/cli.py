@@ -9,6 +9,7 @@ import torch
 from .adapters import ADAPTERS, resolve_adapter
 from .archive import SunArchive
 from .builder import BuildConfig, build_sun
+from .model_bundle import build_model_bundle, resolve_model_source
 from .runtime import DEFAULT_WORKSPACE_MIB, load_sun_model, model_input_device
 
 
@@ -36,7 +37,14 @@ def _parser() -> argparse.ArgumentParser:
     b.add_argument("--svd-oversample", type=int, default=8)
     b.add_argument("--error-chunk-rows", type=int, default=256)
     b.add_argument("--trust-remote-code", action="store_true")
-    r = sub.add_parser("run", help="Run generation from a generative .sun archive")
+
+    bundle = sub.add_parser("bundle", help="Create a self-contained offline model directory")
+    bundle.add_argument("archive", help="Source .sun archive")
+    bundle.add_argument("--output", required=True, help="Output model directory")
+    bundle.add_argument("--revision", help="Optional pinned Hugging Face revision")
+    bundle.add_argument("--force", action="store_true", help="Replace an existing output directory")
+
+    r = sub.add_parser("run", help="Run generation from a .sun archive or model bundle")
     r.add_argument("archive")
     r.add_argument("--prompt", required=True)
     r.add_argument(
@@ -127,8 +135,10 @@ def main() -> None:
             )
         )
         print(path)
+    elif args.command == "bundle":
+        print(build_model_bundle(args.archive, args.output, revision=args.revision, force=args.force))
     elif args.command == "inspect":
-        manifest = SunArchive.read_manifest(args.archive)
+        manifest = SunArchive.read_manifest(resolve_model_source(args.archive))
         print(json.dumps(asdict(manifest), ensure_ascii=False, indent=2, default=str))
     elif args.command == "probe":
         adapter, config = resolve_adapter(args.model, args.task, trust_remote_code=args.trust_remote_code)
@@ -138,13 +148,14 @@ def main() -> None:
             raise SystemExit("--workspace-mib must be positive")
         if args.device not in {"auto", "out-of-core", "layer"} and (args.max_memory or args.offload_folder):
             raise SystemExit("--max-memory and --offload-folder require --device auto, out-of-core, or layer")
-        manifest = SunArchive.read_manifest(args.archive)
+        archive = resolve_model_source(args.archive)
+        manifest = SunArchive.read_manifest(archive)
         task = str(manifest.metadata.get("task", "causal-lm"))
         adapter, _ = resolve_adapter(manifest.base_model, task, trust_remote_code=args.trust_remote_code)
         if not adapter.generative:
             raise SystemExit(f"Task {task!r} is not generative; use load_sun_model() from Python")
         model, frontend = load_sun_model(
-            args.archive,
+            str(archive),
             device=args.device,
             dtype=DTYPES[args.dtype],
             trust_remote_code=args.trust_remote_code,
@@ -154,7 +165,7 @@ def main() -> None:
             offload_folder=args.offload_folder,
             checkpoint_cache=args.checkpoint_cache,
             revision=args.revision,
-            local_files_only=args.local_files_only,
+            local_files_only=args.local_files_only or archive.name == ".yozakura-resolved.sun",
         )
         inputs = frontend(args.prompt, return_tensors="pt").to(model_input_device(model))
         with torch.inference_mode():
